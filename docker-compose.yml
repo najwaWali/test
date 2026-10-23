@@ -1,0 +1,84 @@
+# App configuration is read from .env by pydantic-settings (see app/config.py).
+# The .env file is mounted into the api and worker containers at /app/.env.
+# To tune anything: edit .env and `make up`.
+#
+# Only the `postgres` service and host-side port mappings use ${VAR:-default}
+# interpolation here, because those happen at compose-parse time and the
+# containers themselves don't see them.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-loura}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loura}
+      POSTGRES_DB: ${POSTGRES_DB:-loura}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-loura} -d ${POSTGRES_DB:-loura}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/temporal:latest
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --namespace
+      - ${TEMPORAL_NAMESPACE:-default}
+      - --log-format
+      - pretty
+    ports:
+      - "${TEMPORAL_GRPC_PORT:-7233}:7233"
+    # The dev server also runs a bundled UI on container port 8233 (not mapped).
+    # The dedicated `temporal-ui` service below is what you use at localhost:8080.
+
+  temporal-ui:
+    image: temporalio/ui:2.31.1
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:${TEMPORAL_UI_PORT:-8080}
+    ports:
+      - "${TEMPORAL_UI_PORT:-8080}:8080"
+    depends_on:
+      - temporal
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    ports:
+      - "${API_PORT:-8000}:8000"
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    volumes:
+      - ./app:/app/app
+      - ./tests:/app/tests
+      - ./alembic.ini:/app/alembic.ini
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./.env:/app/.env:ro
+
+  worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    command: python -m app.worker
+    volumes:
+      - ./app:/app/app
+      - ./.env:/app/.env:ro
+
+volumes:
+  postgres-data:
